@@ -1291,7 +1291,11 @@ def generate_form_link(bed_id):
     try:
         token = generate_form_token(bed_id)
         if token:
-            form_url = f"{request.host_url}tenant-form/{token}"
+            # Get the actual host from headers (works behind proxies/reverse proxies)
+            host = request.headers.get('X-Forwarded-Host', request.host)
+            scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+            form_url = f"{scheme}://{host}/tenant-form/{token}"
+            logger.info(f"Generated form URL: {form_url}")
             return jsonify({"success": True, "form_url": form_url})
         return jsonify({"success": False, "error": "Bed not available"})
     except Exception as e:

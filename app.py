@@ -2,16 +2,70 @@ import logging
 import io
 import tempfile
 import csv
+import os
 from flask import Flask, request, jsonify, render_template, send_file, Response
 from database import *
+from pdf_utils import create_image_cell
+from database import cleanup_expired_tokens, get_token_stats
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 from reportlab.lib.pagesizes import A4, letter
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch, cm
 from reportlab.lib import colors
-from reportlab.platypus import PageBreak
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.platypus.tableofcontents import TableOfContents
+from reportlab.platypus.frames import Frame
+from reportlab.platypus.doctemplate import PageTemplate, BaseDocTemplate
+from datetime import datetime
 import io
+
+
+# --------------------------------------------------
+# FILE VALIDATION UTILITIES
+# --------------------------------------------------
+
+ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/jpg', 'image/png', 'image/gif'}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
+def validate_uploaded_file(file, allowed_types=None, max_size=None):
+    """Validate uploaded file for type and size"""
+    if not file or file.filename == '':
+        return None, "No file selected"
+    
+    if allowed_types is None:
+        allowed_types = ALLOWED_IMAGE_TYPES
+    if max_size is None:
+        max_size = MAX_FILE_SIZE
+    
+    # Check file extension
+    filename = file.filename.lower()
+    if not any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+        return None, "Invalid file type. Only JPG, PNG, and GIF images are allowed"
+    
+    # Check MIME type
+    if file.content_type not in allowed_types:
+        return None, f"Invalid file type: {file.content_type}"
+    
+    # Check file size
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)  # Reset file pointer
+    
+    if file_size > max_size:
+        return None, f"File too large. Maximum size is {max_size // (1024*1024)}MB"
+    
+    return file, None
+
+def safe_read_file(file):
+    """Safely read file data with size limit"""
+    try:
+        file.seek(0)
+        data = file.read(MAX_FILE_SIZE)
+        return data
+    except Exception as e:
+        logger.error(f"Error reading file: {e}")
+        return None
 
 
 # --------------------------------------------------
@@ -33,6 +87,13 @@ logger = logging.getLogger("PG_SYSTEM")
 app = Flask(__name__)
 
 init_db()
+
+# Clean up expired form tokens on startup
+try:
+    cleanup_expired_tokens()
+    logger.info("Automatic token cleanup completed on startup")
+except Exception as e:
+    logger.error(f"Automatic token cleanup failed: {e}")
 
 
 # --------------------------------------------------
@@ -189,15 +250,21 @@ def delete_bed_api():
         room = data.get("room")
         bed = data.get("bed")
 
-        success = delete_bed(floor, room, bed)
+        logger.info(f"Delete bed request: floor={floor}, room={room}, bed={bed}")
 
-        return jsonify({"success": success})
+        success, message = delete_bed(floor, room, bed)
+
+        if success:
+            logger.info(f"Bed deleted successfully: {floor}-{room}-{bed}")
+            return jsonify({"success": True, "message": message})
+        else:
+            logger.warning(f"Failed to delete bed: {floor}-{room}-{bed} - {message}")
+            return jsonify({"success": False, "error": message})
 
     except Exception as e:
 
-        logger.error(f"delete_bed error: {e}")
-
-        return jsonify({"success": False})
+        logger.error(f"delete_bed API error: {e}")
+        return jsonify({"success": False, "error": "Server error"})
 
 
 # --------------------------------------------------
@@ -332,20 +399,22 @@ def add_pg_tenant():
         photo = request.files.get("photo")
         aadhar = request.files.get("aadhar")
 
-        logger.info(f"Photo file received: {photo}")
-        logger.info(f"Aadhar file received: {aadhar}")
-        
-        if photo:
-            logger.info(f"Photo filename: {photo.filename}")
-            logger.info(f"Photo content type: {photo.content_type}")
-        
-        if aadhar:
-            logger.info(f"Aadhar filename: {aadhar.filename}")
-            logger.info(f"Aadhar content type: {aadhar.content_type}")
+        # Validate photo file
+        photo_data = None
+        if photo and photo.filename:
+            validated_photo, error = validate_uploaded_file(photo)
+            if error:
+                return jsonify({"success": False, "error": f"Photo validation failed: {error}"})
+            photo_data = safe_read_file(validated_photo)
 
-        photo_data = photo.read() if photo else None
-        aadhar_data = aadhar.read() if aadhar else None
-        
+        # Validate aadhar file  
+        aadhar_data = None
+        if aadhar and aadhar.filename:
+            validated_aadhar, error = validate_uploaded_file(aadhar)
+            if error:
+                return jsonify({"success": False, "error": f"Aadhar validation failed: {error}"})
+            aadhar_data = safe_read_file(validated_aadhar)
+
         logger.info(f"Photo data size: {len(photo_data) if photo_data else 0} bytes")
         logger.info(f"Aadhar data size: {len(aadhar_data) if aadhar_data else 0} bytes")
 
@@ -369,18 +438,22 @@ def update_tenant():
         photo = request.files.get("photo")
         aadhar = request.files.get("aadhar")
 
-        logger.info(f"Update - Photo file received: {photo}")
-        logger.info(f"Update - Aadhar file received: {aadhar}")
-        
-        if photo:
-            logger.info(f"Update - Photo filename: {photo.filename}")
-        
-        if aadhar:
-            logger.info(f"Update - Aadhar filename: {aadhar.filename}")
+        # Validate photo file
+        photo_data = None
+        if photo and photo.filename:
+            validated_photo, error = validate_uploaded_file(photo)
+            if error:
+                return jsonify({"success": False, "error": f"Photo validation failed: {error}"})
+            photo_data = safe_read_file(validated_photo)
 
-        photo_data = photo.read() if photo else None
-        aadhar_data = aadhar.read() if aadhar else None
-        
+        # Validate aadhar file  
+        aadhar_data = None
+        if aadhar and aadhar.filename:
+            validated_aadhar, error = validate_uploaded_file(aadhar)
+            if error:
+                return jsonify({"success": False, "error": f"Aadhar validation failed: {error}"})
+            aadhar_data = safe_read_file(validated_aadhar)
+
         logger.info(f"Update - Photo data size: {len(photo_data) if photo_data else 0} bytes")
         logger.info(f"Update - Aadhar data size: {len(aadhar_data) if aadhar_data else 0} bytes")
 
@@ -598,6 +671,316 @@ def get_aadhar(bed_id):
 
 
 # --------------------------------------------------
+# GET FORMER TENANT PHOTO
+# --------------------------------------------------
+
+@app.route("/former/photo/<int:former_id>")
+def get_former_photo(former_id):
+
+    try:
+
+        tenant = get_former_tenant(former_id)
+
+        if tenant and tenant["photo"]:
+
+            return send_file(
+                io.BytesIO(tenant["photo"]),
+                mimetype="image/jpeg"
+            )
+
+        return "", 404
+
+    except Exception as e:
+
+        logger.error(f"former photo error: {e}")
+
+        return "", 500
+
+
+# --------------------------------------------------
+# GET FORMER TENANT AADHAR
+# --------------------------------------------------
+
+@app.route("/former/aadhar/<int:former_id>")
+def get_former_aadhar(former_id):
+
+    try:
+
+        tenant = get_former_tenant(former_id)
+
+        if tenant and tenant["aadhar"]:
+
+            return send_file(
+                io.BytesIO(tenant["aadhar"]),
+                mimetype="image/jpeg"
+            )
+
+        return "", 404
+
+    except Exception as e:
+
+        logger.error(f"former aadhar error: {e}")
+
+        return "", 500
+
+
+# --------------------------------------------------
+# DOWNLOAD TENANT PDF
+# --------------------------------------------------
+
+@app.route("/download_tenant/<int:bed_id>")
+def download_tenant_pdf(bed_id):
+    try:
+        tenant = get_tenant(bed_id)
+        
+        if not tenant:
+            return "Tenant not found", 404
+            
+        buffer = io.BytesIO()
+        
+        # Create PDF with tenant details
+        doc = SimpleDocTemplate(
+            buffer, 
+            pagesize=A4,
+            leftMargin=0.5*inch, 
+            rightMargin=0.5*inch,
+            topMargin=1.0*inch, 
+            bottomMargin=0.8*inch
+        )
+        
+        styles = getSampleStyleSheet()
+        elements = []
+        
+        # Professional title styles
+        from professional_pdf import create_professional_title_style, create_professional_table_style, create_summary_box, create_professional_footer
+        
+        title_style, subtitle_style, section_style = create_professional_title_style()
+        
+        # Header
+        elements.append(Paragraph("PG MANAGEMENT SYSTEM", title_style))
+        elements.append(Paragraph("TENANT DETAILS", title_style))
+        elements.append(Paragraph(f"Tenant Profile - {tenant['tenant_name'] or 'N/A'}", subtitle_style))
+        elements.append(Spacer(1, 20))
+        
+        # Personal Information Section
+        elements.append(Paragraph("👤 Personal Information", section_style))
+        
+        personal_data = [
+            ['Field', 'Value'],
+            ['Name', tenant['tenant_name'] or 'N/A'],
+            ['Father Name', tenant['father_name'] or 'N/A'],
+            ['Mother Name', tenant['mother_name'] or 'N/A'],
+            ['Date of Birth', tenant['dob'] or 'N/A'],
+            ['Phone', tenant['phone'] or 'N/A'],
+            ['Email', tenant['email'] or 'N/A'],
+            ['Aadhar Number', tenant['aadhar_number'] or 'N/A']
+        ]
+        
+        personal_table = Table(personal_data, colWidths=[2*inch, 4*inch])
+        personal_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        elements.append(personal_table)
+        elements.append(Spacer(1, 20))
+        
+        # Photo & Documents Section
+        elements.append(Paragraph("📷 Photo & Documents", section_style))
+        
+        # Create images section
+        images_data = []
+        
+        # Add photo if available
+        if tenant.get('photo'):
+            try:
+                # Add tenant photo
+                photo_buffer = io.BytesIO(tenant['photo'])
+                photo_image = Image(photo_buffer, width=2*inch, height=2.5*inch)
+                photo_data = [
+                    [Paragraph("Tenant Photo:", getSampleStyleSheet()['Heading6'])],
+                    [photo_image]
+                ]
+                photo_table = Table(photo_data, colWidths=[2*inch])
+                photo_table.setStyle(TableStyle([
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                ]))
+                images_data.append([photo_table])
+            except Exception as e:
+                logger.error(f"Error adding photo to PDF: {e}")
+                images_data.append([Paragraph("Photo: Unable to display", getSampleStyleSheet()['Normal'])])
+        else:
+            images_data.append([Paragraph("Photo: Not available", getSampleStyleSheet()['Normal'])])
+        
+        # Add Aadhar card if available
+        if tenant.get('aadhar'):
+            try:
+                # Add Aadhar card image
+                aadhar_buffer = io.BytesIO(tenant['aadhar'])
+                aadhar_image = Image(aadhar_buffer, width=2*inch, height=2.5*inch)
+                aadhar_data = [
+                    [Paragraph("Aadhar Card:", getSampleStyleSheet()['Heading6'])],
+                    [aadhar_image]
+                ]
+                aadhar_table = Table(aadhar_data, colWidths=[2*inch])
+                aadhar_table.setStyle(TableStyle([
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                ]))
+                images_data.append([aadhar_table])
+            except Exception as e:
+                logger.error(f"Error adding Aadhar to PDF: {e}")
+                images_data.append([Paragraph("Aadhar Card: Unable to display", getSampleStyleSheet()['Normal'])])
+        else:
+            images_data.append([Paragraph("Aadhar Card: Not available", getSampleStyleSheet()['Normal'])])
+        
+        # Create images table side by side
+        if len(images_data) > 0:
+            images_table = Table(images_data, colWidths=[2.5*inch, 2.5*inch])
+            images_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ]))
+            elements.append(images_table)
+        
+        elements.append(Spacer(1, 20))
+        
+        # Address Information Section
+        elements.append(Paragraph("🏠 Address Information", section_style))
+        
+        address_data = [
+            ['Field', 'Value'],
+            ['Address', tenant['address'] or 'N/A'],
+            ['Street', tenant['street'] or 'N/A'],
+            ['Area', tenant['area'] or 'N/A'],
+            ['Pincode', tenant['pincode'] or 'N/A']
+        ]
+        
+        address_table = Table(address_data, colWidths=[2*inch, 4*inch])
+        address_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        elements.append(address_table)
+        elements.append(Spacer(1, 20))
+        
+        # PG Information Section
+        elements.append(Paragraph("🏢 PG Information", section_style))
+        
+        pg_data = [
+            ['Field', 'Value'],
+            ['Floor', tenant['floor'] or 'N/A'],
+            ['Room', tenant['room'] or 'N/A'],
+            ['Bed', tenant['bed'] or 'N/A'],
+            ['Room Type', tenant['room_type'] or 'N/A'],
+            ['Check-in Date', tenant['checkin_date'] or 'N/A'],
+            ['Deposit', f"Rs.{tenant['deposit']}" if tenant['deposit'] else 'N/A'],
+            ['Rent', f"Rs.{tenant['rent']}" if tenant['rent'] else 'N/A']
+        ]
+        
+        pg_table = Table(pg_data, colWidths=[2*inch, 4*inch])
+        pg_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        elements.append(pg_table)
+        elements.append(Spacer(1, 20))
+        
+        # Office Information Section
+        elements.append(Paragraph("💼 Office Information", section_style))
+        
+        office_data = [
+            ['Field', 'Value'],
+            ['Office Name', tenant['office_name'] or 'N/A'],
+            ['Office Address', tenant['office_address'] or 'N/A']
+        ]
+        
+        office_table = Table(office_data, colWidths=[2*inch, 4*inch])
+        office_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        elements.append(office_table)
+        elements.append(Spacer(1, 20))
+        
+        # Emergency Contact Section
+        elements.append(Paragraph("🚨 Emergency Contact", section_style))
+        
+        emergency_data = [
+            ['Field', 'Value'],
+            ['Contact Name', tenant['emergency_name'] or 'N/A'],
+            ['Contact Phone', tenant['emergency_phone'] or 'N/A'],
+            ['Relation', tenant['emergency_relation'] or 'N/A']
+        ]
+        
+        emergency_table = Table(emergency_data, colWidths=[2*inch, 4*inch])
+        emergency_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        elements.append(emergency_table)
+        elements.append(Spacer(1, 25))
+        
+        # Footer
+        elements.append(create_professional_footer())
+        
+        # Build PDF
+        doc.build(elements, onFirstPage=on_first_page, onLaterPages=on_later_pages)
+        
+        buffer.seek(0)
+        
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f'tenant_{tenant["tenant_name"] or "unknown"}_{bed_id}.pdf',
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        logger.error(f"Download tenant PDF error: {e}")
+        return "Error generating PDF", 500
+
+
+# --------------------------------------------------
 # EXPORT ALL TENANTS CSV
 # --------------------------------------------------
 
@@ -611,7 +994,7 @@ def export_all_tenants_csv():
             SELECT tenant_name, father_name, mother_name, address, street, area, pincode,
                    aadhar_number, dob, email, phone, office_name, office_address,
                    deposit, rent, floor, room, bed, room_type, checkin_date,
-                   emergency_name, emergency_phone, emergency_relation
+                   emergency_name, emergency_phone, emergency_relation, photo, aadhar
             FROM rooms 
             WHERE tenant_name IS NOT NULL AND tenant_name != ''
             ORDER BY floor, room, bed
@@ -650,6 +1033,30 @@ def export_all_tenants_csv():
 # EXPORT ALL TENANTS PDF
 # --------------------------------------------------
 
+def on_first_page(canvas, doc):
+    # Professional header
+    canvas.saveState()
+    canvas.setFont('Helvetica-Bold', 12)
+    canvas.setFillColor(colors.darkblue)
+    canvas.drawString(0.5*inch, 10.5*inch, "PG MANAGEMENT SYSTEM")
+    canvas.line(0.5*inch, 10.3*inch, 7.5*inch, 10.3*inch)
+    canvas.restoreState()
+
+def on_later_pages(canvas, doc):
+    # Header for subsequent pages
+    canvas.saveState()
+    canvas.setFont('Helvetica-Bold', 10)
+    canvas.setFillColor(colors.darkblue)
+    canvas.drawString(0.5*inch, 10.5*inch, "PG MANAGEMENT SYSTEM - TENANTS REPORT")
+    canvas.line(0.5*inch, 10.3*inch, 7.5*inch, 10.3*inch)
+    
+    # Footer with page number
+    canvas.setFont('Helvetica', 9)
+    canvas.setFillColor(colors.grey)
+    canvas.drawRightString(7.5*inch, 0.5*inch, f"Page {doc.page}")
+    canvas.drawString(0.5*inch, 0.5*inch, f"Generated: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}")
+    canvas.restoreState()
+
 @app.route("/export/all_tenants/pdf")
 def export_all_tenants_pdf():
     try:
@@ -660,7 +1067,7 @@ def export_all_tenants_pdf():
             SELECT tenant_name, father_name, mother_name, address, street, area, pincode,
                    aadhar_number, dob, email, phone, office_name, office_address,
                    deposit, rent, floor, room, bed, room_type, checkin_date,
-                   emergency_name, emergency_phone, emergency_relation
+                   emergency_name, emergency_phone, emergency_relation, photo, aadhar
             FROM rooms 
             WHERE tenant_name IS NOT NULL AND tenant_name != ''
             ORDER BY floor, room, bed
@@ -669,44 +1076,151 @@ def export_all_tenants_pdf():
         tenants = cur.fetchall()
         
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        
+        # Full page utilization with minimal margins to prevent title cutoff
+        doc = SimpleDocTemplate(
+            buffer, 
+            pagesize=A4,
+            leftMargin=0.2*inch, 
+            rightMargin=0.2*inch,
+            topMargin=1.0*inch, 
+            bottomMargin=0.8*inch
+        )
+        
         styles = getSampleStyleSheet()
         elements = []
         
-        # Title
-        elements.append(Paragraph("All Tenants Report", styles['Title']))
+        # Professional title styles
+        from professional_pdf import create_professional_title_style, create_professional_table_style, create_summary_box, create_professional_footer, create_instructions_note
+        
+        title_style, subtitle_style, section_style = create_professional_title_style()
+        elements = []
+        
+        # Professional header with proper spacing
+        elements.append(Paragraph("PG MANAGEMENT SYSTEM", title_style))
+        elements.append(Paragraph("ALL TENANTS REPORT", title_style))
+        elements.append(Paragraph(f"Comprehensive Tenant Listing as of {datetime.now().strftime('%d %B %Y')}", subtitle_style))
         elements.append(Spacer(1, 20))
         
-        # Table data
-        data = [['Tenant Name', 'Floor', 'Room', 'Bed', 'Phone', 'Email', 'Checkin Date', 'Rent']]
+        # Instructions for clickable buttons
+        elements.append(create_instructions_note())
+        elements.append(Spacer(1, 15))
         
-        for tenant in tenants:
+        # Professional summary section
+        elements.append(Paragraph("📊 Report Summary", section_style))
+        elements.append(create_summary_box(len(tenants)))
+        elements.append(Spacer(1, 25))
+        
+        # Enhanced table data with both clickable links and visible URLs
+        headers = ['S.No', 'Tenant Name', 'Photo', 'Aadhar', 'Floor', 'Room Type', 'Bed', 'Phone', 'Email', 'Checkin Date', 'Rent']
+        data = [headers]
+        
+        for idx, tenant in enumerate(tenants, 1):
+            # Extract image data (last two columns)
+            photo_data = tenant[23] if len(tenant) > 23 and tenant[23] else None
+            aadhar_data = tenant[24] if len(tenant) > 24 and tenant[24] else None
+            
+            # Create clickable links with visible URLs
+            styles = getSampleStyleSheet()
+            link_style = ParagraphStyle(
+                'LinkStyle',
+                parent=styles['Normal'],
+                fontSize=6,
+                alignment=TA_CENTER,
+                textColor=colors.blue,
+                fontName='Helvetica-Bold'
+            )
+            url_style = ParagraphStyle(
+                'UrlStyle', 
+                parent=styles['Normal'],
+                fontSize=5,
+                alignment=TA_CENTER,
+                textColor=colors.darkgrey,
+                fontName='Helvetica'
+            )
+            normal_style = ParagraphStyle(
+                'NormalCell',
+                parent=styles['Normal'],
+                fontSize=8,
+                alignment=TA_CENTER,
+                textColor=colors.black
+            )
+            
+            # Get bed_id for creating links
+            cur.execute("""
+                SELECT id FROM rooms 
+                WHERE floor = %s AND room = %s AND bed = %s AND tenant_name = %s
+                LIMIT 1
+            """, (tenant[15], tenant[16], tenant[17], tenant[0]))
+            
+            bed_result = cur.fetchone()
+            bed_id = bed_result[0] if bed_result else None
+            base_url = request.host_url.rstrip('/')
+            
+            # Create photo cell with clickable link and visible URL
+            if photo_data and bed_id:
+                photo_url = f"{base_url}/photo/{bed_id}"
+                # Shorten URL for display
+                short_url = photo_url.replace(base_url, "")
+                photo_cell = [[
+                    Paragraph(f'<a href="{photo_url}" color="blue"><u>VIEW</u></a>', link_style),
+                    Paragraph(f'<font size="1">{short_url}</font>', url_style)
+                ]]
+            else:
+                photo_cell = [[Paragraph("No Photo", normal_style)]]
+                
+            # Create Aadhar cell with clickable link and visible URL
+            if aadhar_data and bed_id:
+                aadhar_url = f"{base_url}/aadhar/{bed_id}"
+                # Shorten URL for display
+                short_url = aadhar_url.replace(base_url, "")
+                aadhar_cell = [[
+                    Paragraph(f'<a href="{aadhar_url}" color="blue"><u>VIEW</u></a>', link_style),
+                    Paragraph(f'<font size="1">{short_url}</font>', url_style)
+                ]]
+            else:
+                aadhar_cell = [[Paragraph("No Aadhar", normal_style)]]
+            
             data.append([
-                tenant[0],  # tenant_name
-                tenant[15], # floor
-                tenant[16], # room
-                tenant[17], # bed
-                tenant[10], # phone
-                tenant[9],  # email
-                tenant[18], # checkin_date
-                f"₹{tenant[14]}"  # rent
+                str(idx),  # Serial number
+                tenant[0] if tenant[0] else '',  # tenant_name
+                photo_cell,  # Photo
+                aadhar_cell,  # Aadhar
+                tenant[15] if tenant[15] else '',  # floor
+                tenant[16] if tenant[16] else '',  # room (now labeled as Room Type)
+                tenant[17] if tenant[17] else '',  # bed
+                tenant[10] if tenant[10] else '',  # phone
+                tenant[9] if tenant[9] else '',    # email
+                tenant[18] if tenant[18] else '',  # checkin_date
+                f"Rs.{tenant[14]}" if tenant[14] else ''  # rent
             ])
         
-        table = Table(data, colWidths=[80, 40, 40, 30, 60, 80, 50, 40])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 8),
-        ]))
+        # Calculate optimal column widths to prevent text overlap
+        col_widths = [
+            0.4*inch,   # S.No
+            1.0*inch,   # Tenant Name
+            0.6*inch,   # Photo (with links and URLs)
+            0.6*inch,   # Aadhar (with links and URLs)
+            0.7*inch,   # Floor (wider for "GROUND FLOOR")
+            1.3*inch,   # Room Type (much wider for "4 SHARING AC ROOM")
+            0.4*inch,   # Bed
+            0.7*inch,   # Phone
+            1.0*inch,   # Email
+            0.9*inch,   # Checkin Date (wider for dates)
+            0.5*inch    # Rent
+        ]
+        
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(create_professional_table_style())
         
         elements.append(table)
-        doc.build(elements)
+        elements.append(Spacer(1, 25))
+        
+        # Professional footer
+        elements.append(create_professional_footer())
+        
+        # Build PDF with professional page templates
+        doc.build(elements, onFirstPage=on_first_page, onLaterPages=on_later_pages)
         
         buffer.seek(0)
         
@@ -723,6 +1237,150 @@ def export_all_tenants_pdf():
 
 
 # --------------------------------------------------
+# GET TENANT DOCUMENT URLS
+# --------------------------------------------------
+
+@app.route("/tenant/<int:bed_id>/document-urls")
+def get_tenant_document_urls(bed_id):
+    try:
+        tenant = get_tenant(bed_id)
+        
+        if not tenant:
+            return jsonify({"error": "Tenant not found"}), 404
+        
+        base_url = request.host_url.rstrip('/')
+        urls = {
+            "tenant_name": tenant.get("tenant_name", "Unknown"),
+            "photo_url": f"{base_url}/photo/{bed_id}" if tenant.get("photo") else None,
+            "aadhar_url": f"{base_url}/aadhar/{bed_id}" if tenant.get("aadhar") else None,
+            "download_pdf_url": f"{base_url}/download_tenant/{bed_id}"
+        }
+        
+        return jsonify(urls)
+        
+    except Exception as e:
+        logger.error(f"get_tenant_document_urls error: {e}")
+        return jsonify({"error": "Server error"}), 500
+
+
+# --------------------------------------------------
+# TOKEN CLEANUP ENDPOINT
+# --------------------------------------------------
+
+@app.route("/admin/cleanup-tokens", methods=["POST"])
+def cleanup_tokens():
+    try:
+        cleanup_expired_tokens()
+        stats = get_token_stats()
+        return jsonify({
+            "success": True, 
+            "message": "Token cleanup completed",
+            "stats": stats
+        })
+    except Exception as e:
+        logger.error(f"cleanup_tokens error: {e}")
+        return jsonify({"success": False, "error": "Cleanup failed"})
+
+
+# --------------------------------------------------
+# GENERATE FORM LINK FOR EMPTY BED
+# --------------------------------------------------
+
+@app.route("/generate-form-link/<int:bed_id>", methods=["POST"])
+def generate_form_link(bed_id):
+    try:
+        token = generate_form_token(bed_id)
+        if token:
+            form_url = f"{request.host_url}tenant-form/{token}"
+            return jsonify({"success": True, "form_url": form_url})
+        return jsonify({"success": False, "error": "Bed not available"})
+    except Exception as e:
+        logger.error(f"generate_form_link error: {e}")
+        return jsonify({"success": False})
+
+# --------------------------------------------------
+# TENANT FORM PAGE
+# --------------------------------------------------
+
+@app.route("/tenant-form/<token>")
+def tenant_form_page(token):
+    try:
+        bed = get_bed_by_token(token)
+        if not bed:
+            return "Invalid or expired form link", 404
+        
+        return render_template("tenant_form.html", 
+                             bed=bed, 
+                             token=token)
+    except Exception as e:
+        logger.error(f"tenant_form_page error: {e}")
+        return "Error loading form", 500
+
+# --------------------------------------------------
+# SUBMIT TENANT FORM
+# --------------------------------------------------
+
+@app.route("/submit-tenant-form/<token>", methods=["POST"])
+def submit_tenant_form(token):
+    try:
+        bed = get_bed_by_token(token)
+        if not bed:
+            return jsonify({"success": False, "error": "Invalid token"})
+        
+        data = {
+            "name": request.form.get("name"),
+            "father": request.form.get("father"),
+            "mother": request.form.get("mother"),
+            "address": request.form.get("address"),
+            "street": request.form.get("street"),
+            "area": request.form.get("area"),
+            "pincode": request.form.get("pincode"),
+            "aadhar_number": request.form.get("aadhar_number"),
+            "dob": request.form.get("dob"),
+            "email": request.form.get("email"),
+            "phone": request.form.get("phone"),
+            "office_name": request.form.get("office_name"),
+            "office_address": request.form.get("office_address"),
+            "deposit": request.form.get("deposit"),
+            "rent": request.form.get("rent"),
+            "room_type": request.form.get("room_type"),
+            "checkin": request.form.get("checkin"),
+            "emergency_name": request.form.get("emergency_name"),
+            "emergency_phone": request.form.get("emergency_phone"),
+            "emergency_relation": request.form.get("emergency_relation")
+        }
+        
+        photo = request.files.get("photo")
+        aadhar = request.files.get("aadhar")
+        
+        # Validate photo file
+        photo_data = None
+        if photo and photo.filename:
+            validated_photo, error = validate_uploaded_file(photo)
+            if error:
+                return jsonify({"success": False, "error": f"Photo validation failed: {error}"})
+            photo_data = safe_read_file(validated_photo)
+
+        # Validate aadhar file  
+        aadhar_data = None
+        if aadhar and aadhar.filename:
+            validated_aadhar, error = validate_uploaded_file(aadhar)
+            if error:
+                return jsonify({"success": False, "error": f"Aadhar validation failed: {error}"})
+            aadhar_data = safe_read_file(validated_aadhar)
+        
+        success = add_tenant_via_form(token, data, photo_data, aadhar_data)
+        
+        if success:
+            return jsonify({"success": True, "message": "Registration successful!"})
+        return jsonify({"success": False, "error": "Registration failed"})
+        
+    except Exception as e:
+        logger.error(f"submit_tenant_form error: {e}")
+        return jsonify({"success": False, "error": "Server error"})
+
+
+# --------------------------------------------------
 # EXPORT FORMER TENANTS CSV
 # --------------------------------------------------
 
@@ -736,7 +1394,7 @@ def export_former_tenants_csv():
             SELECT tenant_name, father_name, mother_name, address, street, area, pincode,
                    aadhar_number, dob, email, phone, office_name, office_address,
                    deposit, rent, floor, room, bed, room_type, checkin_date, leaving_date,
-                   emergency_name, emergency_phone, emergency_relation
+                   emergency_name, emergency_phone, emergency_relation, photo, aadhar
             FROM former_tenants 
             ORDER BY leaving_date DESC, created_at DESC
         """)
@@ -784,53 +1442,160 @@ def export_former_tenants_pdf():
             SELECT tenant_name, father_name, mother_name, address, street, area, pincode,
                    aadhar_number, dob, email, phone, office_name, office_address,
                    deposit, rent, floor, room, bed, room_type, checkin_date, leaving_date,
-                   emergency_name, emergency_phone, emergency_relation
+                   emergency_name, emergency_phone, emergency_relation, photo, aadhar
             FROM former_tenants 
-            ORDER BY leaving_date DESC, created_at DESC
+            ORDER BY floor, room, bed
         """)
         
         tenants = cur.fetchall()
         
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        
+        # Full page utilization with minimal margins to prevent title cutoff
+        doc = SimpleDocTemplate(
+            buffer, 
+            pagesize=A4,
+            leftMargin=0.2*inch, 
+            rightMargin=0.2*inch,
+            topMargin=1.0*inch, 
+            bottomMargin=0.8*inch
+        )
+        
         styles = getSampleStyleSheet()
         elements = []
         
-        # Title
-        elements.append(Paragraph("Former Tenants Report", styles['Title']))
+        # Professional title styles
+        from professional_pdf import create_professional_title_style, create_professional_table_style, create_summary_box, create_professional_footer, create_instructions_note
+        
+        title_style, subtitle_style, section_style = create_professional_title_style()
+        elements = []
+        
+        # Professional header with proper spacing
+        elements.append(Paragraph("PG MANAGEMENT SYSTEM", title_style))
+        elements.append(Paragraph("FORMER TENANTS REPORT", title_style))
+        elements.append(Paragraph(f"Comprehensive Former Tenant Listing as of {datetime.now().strftime('%d %B %Y')}", subtitle_style))
         elements.append(Spacer(1, 20))
         
-        # Table data
-        data = [['Tenant Name', 'Floor', 'Room', 'Bed', 'Phone', 'Email', 'Checkin Date', 'Leaving Date', 'Rent']]
+        # Instructions for clickable buttons
+        elements.append(create_instructions_note())
+        elements.append(Spacer(1, 15))
         
-        for tenant in tenants:
+        # Professional summary section
+        elements.append(Paragraph("📊 Report Summary", section_style))
+        elements.append(create_summary_box(len(tenants)))
+        elements.append(Spacer(1, 25))
+        
+        # Enhanced table data with both clickable links and visible URLs
+        headers = ['S.No', 'Tenant Name', 'Photo', 'Aadhar', 'Floor', 'Room Type', 'Bed', 'Phone', 'Email', 'Checkin Date', 'Leaving Date', 'Rent']
+        data = [headers]
+        
+        for idx, tenant in enumerate(tenants, 1):
+            # Extract image data (last two columns)
+            photo_data = tenant[23] if len(tenant) > 23 and tenant[23] else None
+            aadhar_data = tenant[24] if len(tenant) > 24 and tenant[24] else None
+            
+            # Create clickable links with visible URLs
+            styles = getSampleStyleSheet()
+            link_style = ParagraphStyle(
+                'LinkStyle',
+                parent=styles['Normal'],
+                fontSize=6,
+                alignment=TA_CENTER,
+                textColor=colors.blue,
+                fontName='Helvetica-Bold'
+            )
+            url_style = ParagraphStyle(
+                'UrlStyle', 
+                parent=styles['Normal'],
+                fontSize=5,
+                alignment=TA_CENTER,
+                textColor=colors.darkgrey,
+                fontName='Helvetica'
+            )
+            normal_style = ParagraphStyle(
+                'NormalCell',
+                parent=styles['Normal'],
+                fontSize=8,
+                alignment=TA_CENTER,
+                textColor=colors.black
+            )
+            
+            # Get bed_id for creating links (from former_tenants table)
+            cur.execute("""
+                SELECT id FROM former_tenants 
+                WHERE floor = %s AND room = %s AND bed = %s AND tenant_name = %s
+                LIMIT 1
+            """, (tenant[15], tenant[16], tenant[17], tenant[0]))
+            
+            bed_result = cur.fetchone()
+            bed_id = bed_result[0] if bed_result else None
+            base_url = request.host_url.rstrip('/')
+            
+            # Create photo cell with clickable link and visible URL
+            if photo_data and bed_id:
+                photo_url = f"{base_url}/former/photo/{bed_id}"
+                # Shorten URL for display
+                short_url = photo_url.replace(base_url, "")
+                photo_cell = [[
+                    Paragraph(f'<a href="{photo_url}" color="blue"><u>VIEW</u></a>', link_style),
+                    Paragraph(f'<font size="1">{short_url}</font>', url_style)
+                ]]
+            else:
+                photo_cell = [[Paragraph("No Photo", normal_style)]]
+                
+            # Create Aadhar cell with clickable link and visible URL
+            if aadhar_data and bed_id:
+                aadhar_url = f"{base_url}/former/aadhar/{bed_id}"
+                # Shorten URL for display
+                short_url = aadhar_url.replace(base_url, "")
+                aadhar_cell = [[
+                    Paragraph(f'<a href="{aadhar_url}" color="blue"><u>VIEW</u></a>', link_style),
+                    Paragraph(f'<font size="1">{short_url}</font>', url_style)
+                ]]
+            else:
+                aadhar_cell = [[Paragraph("No Aadhar", normal_style)]]
+            
             data.append([
-                tenant[0],  # tenant_name
-                tenant[15], # floor
-                tenant[16], # room
-                tenant[17], # bed
-                tenant[10], # phone
-                tenant[9],  # email
-                tenant[18], # checkin_date
-                tenant[19], # leaving_date
-                f"₹{tenant[14]}"  # rent
+                str(idx),  # Serial number
+                tenant[0] if tenant[0] else '',  # tenant_name
+                photo_cell,  # Photo
+                aadhar_cell,  # Aadhar
+                tenant[15] if tenant[15] else '',  # floor
+                tenant[16] if tenant[16] else '',  # room (now labeled as Room Type)
+                tenant[17] if tenant[17] else '',  # bed
+                tenant[10] if tenant[10] else '',  # phone
+                tenant[9] if tenant[9] else '',    # email
+                tenant[18] if tenant[18] else '',  # checkin_date
+                tenant[19] if tenant[19] else '',  # leaving_date
+                f"Rs.{tenant[14]}" if tenant[14] else ''  # rent
             ])
         
-        table = Table(data, colWidths=[80, 40, 40, 30, 60, 80, 50, 50, 40])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 8),
-        ]))
+        # Calculate optimal column widths to prevent text overlap
+        col_widths = [
+            0.4*inch,   # S.No
+            1.0*inch,   # Tenant Name
+            0.6*inch,   # Photo (with links and URLs)
+            0.6*inch,   # Aadhar (with links and URLs)
+            0.7*inch,   # Floor (wider for "GROUND FLOOR")
+            1.3*inch,   # Room Type (much wider for "4 SHARING AC ROOM")
+            0.4*inch,   # Bed
+            0.7*inch,   # Phone
+            1.0*inch,   # Email
+            0.9*inch,   # Checkin Date (wider for dates)
+            0.5*inch    # Rent
+        ]
+        
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(create_professional_table_style())
         
         elements.append(table)
-        doc.build(elements)
+        elements.append(Spacer(1, 25))
+        
+        # Professional footer
+        elements.append(create_professional_footer())
+        
+        # Build PDF with professional page templates
+        doc.build(elements, onFirstPage=on_first_page, onLaterPages=on_later_pages)
         
         buffer.seek(0)
         
@@ -844,238 +1609,5 @@ def export_former_tenants_pdf():
     except Exception as e:
         logger.error(f"Export former tenants PDF error: {e}")
         return "Error exporting data", 500
-
-
-# --------------------------------------------------
-# DOWNLOAD TENANT PDF
-# --------------------------------------------------
-
-@app.route("/download_tenant/<int:bed_id>")
-def download_tenant(bed_id):
-
-    tenant = get_tenant(bed_id)
-
-    if not tenant:
-        return "Tenant not found", 404
-
-    buffer = io.BytesIO()
-
-    styles = getSampleStyleSheet()
-    elements = []
-
-    # -------------------------
-    # HEADER
-    # -------------------------
-
-    elements.append(Paragraph("PG TENANT REGISTRATION FORM", styles['Title']))
-    elements.append(Spacer(1, 20))
-
-    photo = ""
-
-    if tenant["photo"]:
-        photo = Image(io.BytesIO(tenant["photo"]), 1.8*inch, 2*inch)
-
-    header_data = [
-
-        ["Name", tenant["tenant_name"], photo],
-        ["Phone", tenant["phone"], ""],
-        ["Email", tenant["email"], ""],
-
-    ]
-
-    header_table = Table(header_data, colWidths=[120, 260, 120])
-
-    header_table.setStyle(TableStyle([
-        ("GRID",(0,0),(1,-1),1,colors.grey),
-        ("SPAN",(2,0),(2,2)),
-        ("ALIGN",(2,0),(2,2),"CENTER"),
-        ("VALIGN",(2,0),(2,2),"MIDDLE")
-    ]))
-
-    elements.append(header_table)
-    elements.append(Spacer(1,20))
-
-    # -------------------------
-    # PERSONAL DETAILS
-    # -------------------------
-
-    personal_data = [
-
-        ["Name", tenant["tenant_name"]],
-        ["Father Name", tenant["father_name"]],
-        ["Mother Name", tenant["mother_name"]],
-        ["DOB", tenant["dob"]],
-        ["Phone", tenant["phone"]],
-        ["Email", tenant["email"]],
-
-    ]
-
-    table = Table(personal_data, colWidths=[200,350])
-
-    table.setStyle(TableStyle([
-        ("GRID",(0,0),(-1,-1),1,colors.grey),
-        ("BACKGROUND",(0,0),(0,-1),colors.lightgrey)
-    ]))
-
-    elements.append(Paragraph("Personal Details", styles['Heading2']))
-    elements.append(table)
-    elements.append(Spacer(1,20))
-
-    # -------------------------
-    # ADDRESS DETAILS
-    # -------------------------
-
-    address_data = [
-
-        ["Address", tenant["address"]],
-        ["Street", tenant["street"]],
-        ["Area", tenant["area"]],
-        ["Pincode", tenant["pincode"]],
-        ["Aadhar Number", tenant["aadhar_number"]]
-
-    ]
-
-    table = Table(address_data, colWidths=[200,350])
-
-    table.setStyle(TableStyle([
-        ("GRID",(0,0),(-1,-1),1,colors.grey),
-        ("BACKGROUND",(0,0),(0,-1),colors.lightgrey)
-    ]))
-
-    elements.append(Paragraph("Address Details", styles['Heading2']))
-    elements.append(table)
-    elements.append(Spacer(1,20))
-
-    # -------------------------
-    # STAY DETAILS
-    # -------------------------
-
-    stay_data = [
-
-        ["Room", tenant["room"]],
-        ["Bed", tenant["bed"]],
-        ["Room Type", tenant["room_type"]],
-        ["Checkin Date", tenant["checkin_date"]]
-
-    ]
-
-    table = Table(stay_data, colWidths=[200,350])
-
-    table.setStyle(TableStyle([
-        ("GRID",(0,0),(-1,-1),1,colors.grey),
-        ("BACKGROUND",(0,0),(0,-1),colors.lightgrey)
-    ]))
-
-    elements.append(Paragraph("Stay Details", styles['Heading2']))
-    elements.append(table)
-    elements.append(Spacer(1,20))
-
-    # -------------------------
-    # PAYMENT DETAILS
-    # -------------------------
-
-    payment_data = [
-
-        ["Deposit", tenant["deposit"]],
-        ["Rent", tenant["rent"]]
-
-    ]
-
-    table = Table(payment_data, colWidths=[200,350])
-
-    table.setStyle(TableStyle([
-        ("GRID",(0,0),(-1,-1),1,colors.grey),
-        ("BACKGROUND",(0,0),(0,-1),colors.lightgrey)
-    ]))
-
-    elements.append(Paragraph("Payment Details", styles['Heading2']))
-    elements.append(table)
-    elements.append(Spacer(1,20))
-
-    # -------------------------
-    # EMERGENCY CONTACT
-    # -------------------------
-
-    emergency_data = [
-
-        ["Emergency Name", tenant["emergency_name"]],
-        ["Emergency Phone", tenant["emergency_phone"]],
-        ["Relation", tenant["emergency_relation"]]
-
-    ]
-
-    table = Table(emergency_data, colWidths=[200,350])
-
-    table.setStyle(TableStyle([
-        ("GRID",(0,0),(-1,-1),1,colors.grey),
-        ("BACKGROUND",(0,0),(0,-1),colors.lightgrey)
-    ]))
-
-    elements.append(Paragraph("Emergency Contact", styles['Heading2']))
-    elements.append(table)
-    elements.append(Spacer(1,25))
-
-    # -------------------------
-    # AADHAAR IMAGE
-    # -------------------------
-
-    if tenant["aadhar"]:
-
-        elements.append(PageBreak())
-
-        elements.append(Paragraph("Aadhaar Card", styles['Title']))
-        elements.append(Spacer(1,20))
-
-        aadhar = Image(io.BytesIO(tenant["aadhar"]))
-
-        aadhar.drawHeight = 4 * inch
-        aadhar.drawWidth = 7 * inch
-
-        elements.append(aadhar)
-        elements.append(Spacer(1,25))
-
-    # -------------------------
-    # SIGNATURE SECTION
-    # -------------------------
-
-    signature_data = [
-
-        ["Tenant Signature", "", "Owner Signature"]
-
-    ]
-
-    sign_table = Table(signature_data, colWidths=[200,200,200])
-
-    sign_table.setStyle(TableStyle([
-        ("LINEABOVE",(0,0),(0,0),1,colors.black),
-        ("LINEABOVE",(2,0),(2,0),1,colors.black),
-        ("ALIGN",(0,0),(2,0),"CENTER")
-    ]))
-
-    elements.append(sign_table)
-
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    doc.build(elements)
-
-    buffer.seek(0)
-
-    return send_file(
-        buffer,
-        as_attachment=True,
-        download_name=f"{tenant['tenant_name']}_tenant.pdf",
-        mimetype="application/pdf"
-    )
-
-@app.route("/favicon.ico")
-def favicon():
-    return "", 204
-
-# --------------------------------------------------
-# START SERVER
-# --------------------------------------------------
-
-if __name__ == "__main__":
-
-    logger.info("PG Management Server Started")
-
-    app.run(debug=True)
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)

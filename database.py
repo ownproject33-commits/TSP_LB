@@ -1,7 +1,9 @@
 import os
 import logging
 import psycopg2
-from datetime import datetime
+import secrets
+import hashlib
+from datetime import datetime, timedelta
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
@@ -99,7 +101,8 @@ def init_db():
             emergency_relation TEXT,
 
             photo BYTEA,
-            aadhar BYTEA
+            aadhar BYTEA,
+            form_token TEXT UNIQUE
 
         )
 
@@ -601,23 +604,47 @@ def delete_bed(floor, room, bed):
 
     try:
 
+        # Clean up whitespace in input parameters
+        clean_floor = floor.strip()
+        clean_room = room.strip()
+        clean_bed = bed.strip()
+        
+        logger.info(f"Delete bed request: floor='{clean_floor}', room='{clean_room}', bed='{clean_bed}'")
+
+        # Check if bed exists and is empty
+        cur.execute("""
+            SELECT tenant_name FROM rooms 
+            WHERE floor=%s AND room=%s AND bed=%s
+        """, (clean_floor, clean_room, clean_bed))
+
+        existing_bed = cur.fetchone()
+
+        if not existing_bed:
+            logger.warning(f"Bed not found: {clean_floor}-{clean_room}-{clean_bed}")
+            return False, "Bed not found"
+
+        if existing_bed[0]:  # If tenant_name is not None/empty
+            logger.warning(f"Cannot delete occupied bed: {clean_floor}-{clean_room}-{clean_bed} (tenant: {existing_bed[0]})")
+            return False, "Cannot delete bed - it is occupied"
+
+        # Delete the bed
         cur.execute(
             "DELETE FROM rooms WHERE floor=%s AND room=%s AND bed=%s",
-            (floor, room, bed)
+            (clean_floor, clean_room, clean_bed)
         )
 
         conn.commit()
 
-        logger.info(f"Bed deleted {floor}-{room}-{bed}")
+        logger.info(f"Bed deleted successfully: {clean_floor}-{clean_room}-{clean_bed}")
 
-        return True
+        return True, "Bed deleted successfully"
 
     except Exception as e:
 
         conn.rollback()
         logger.error(f"delete_bed error: {e}")
 
-        return False
+        return False, f"Database error: {str(e)}"
 
     finally:
 
@@ -651,5 +678,218 @@ def delete_floor(floor):
 
     finally:
 
+        cur.close()
+        release(conn)
+# --------------------------------------------------
+# GET FORMER TENANT BY ID
+# --------------------------------------------------
+
+def get_former_tenant(former_id):
+    conn = connect()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        cur.execute("""
+            SELECT tenant_name, father_name, mother_name, address, street, area, pincode,
+                   aadhar_number, dob, email, phone, office_name, office_address,
+                   deposit, rent, floor, room, bed, room_type, checkin_date, leaving_date,
+                   emergency_name, emergency_phone, emergency_relation, photo, aadhar
+            FROM former_tenants
+            WHERE id = %s
+        """, (former_id,))
+
+        tenant = cur.fetchone()
+        return tenant
+
+    except Exception as e:
+        logger.error(f"get_former_tenant error: {e}")
+        return None
+
+    finally:
+        cur.close()
+        release(conn)
+
+# --------------------------------------------------
+# FORM TOKEN FUNCTIONS
+# --------------------------------------------------
+
+def generate_form_token(bed_id):
+    """Generate unique form token for a bed"""
+    conn = connect()
+    cur = conn.cursor()
+    
+    try:
+        # Check if bed exists and is truly empty
+        cur.execute(
+            "SELECT id, floor, room, bed, tenant_name FROM rooms WHERE id = %s",
+            (bed_id,)
+        )
+        bed_info = cur.fetchone()
+        
+        if not bed_info:
+            logger.error(f"Bed with ID {bed_id} not found")
+            return None
+            
+        logger.info(f"Bed info: {bed_info}")
+        
+        if bed_info[4]:  # tenant_name is not None/empty
+            logger.error(f"Bed {bed_id} is not empty - tenant: {bed_info[4]}")
+            return None
+        
+        # Generate unique token
+        token = secrets.token_urlsafe(32)
+        logger.info(f"Generated token for bed {bed_id}: {token}")
+        
+        # Update bed with token
+        cur.execute(
+            "UPDATE rooms SET form_token = %s WHERE id = %s AND tenant_name IS NULL",
+            (token, bed_id)
+        )
+        
+        logger.info(f"Updated bed {bed_id} with token. Rows affected: {cur.rowcount}")
+        
+        conn.commit()
+        return token if cur.rowcount > 0 else None
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"generate_form_token error: {e}")
+        return None
+    finally:
+        cur.close()
+        release(conn)
+
+def get_bed_by_token(token):
+    """Get bed details using form token"""
+    conn = connect()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        cur.execute("""
+            SELECT id, floor, room, bed 
+            FROM rooms 
+            WHERE form_token = %s AND tenant_name IS NULL
+        """, (token,))
+        
+        return cur.fetchone()
+        
+    except Exception as e:
+        logger.error(f"get_bed_by_token error: {e}")
+        return None
+    finally:
+        cur.close()
+        release(conn)
+
+def add_tenant_via_form(token, data, photo=None, aadhar=None):
+    """Add tenant using form token"""
+    conn = connect()
+    cur = conn.cursor()
+    
+    try:
+        # Get bed by token
+        bed = get_bed_by_token(token)
+        if not bed:
+            return False
+        
+        # Update tenant data
+        cur.execute("""
+            UPDATE rooms SET
+                tenant_name=%s, father_name=%s, mother_name=%s,
+                address=%s, street=%s, area=%s, pincode=%s,
+                aadhar_number=%s, dob=%s, email=%s, phone=%s,
+                office_name=%s, office_address=%s, deposit=%s, rent=%s,
+                room_type=%s, checkin_date=%s, emergency_name=%s,
+                emergency_phone=%s, emergency_relation=%s,
+                photo=%s, aadhar=%s, form_token=NULL
+            WHERE id = %s
+        """, (
+            data.get("name"), data.get("father"), data.get("mother"),
+            data.get("address"), data.get("street"), data.get("area"), data.get("pincode"),
+            data.get("aadhar_number"), data.get("dob"), data.get("email"), data.get("phone"),
+            data.get("office_name"), data.get("office_address"), 
+            data.get("deposit"), data.get("rent"), data.get("room_type"), data.get("checkin"),
+            data.get("emergency_name"), data.get("emergency_phone"), data.get("emergency_relation"),
+            psycopg2.Binary(photo) if photo else None,
+            psycopg2.Binary(aadhar) if aadhar else None,
+            bed["id"]
+        ))
+        
+        conn.commit()
+        return True
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"add_tenant_via_form error: {e}")
+        return False
+    finally:
+        cur.close()
+        release(conn)
+
+# --------------------------------------------------
+# FORM TOKEN CLEANUP
+# --------------------------------------------------
+
+def cleanup_expired_tokens():
+    """Clean up expired form tokens (older than 24 hours)"""
+    conn = connect()
+    cur = conn.cursor()
+    
+    try:
+        # Clear tokens that are older than 24 hours
+        cur.execute("""
+            UPDATE rooms 
+            SET form_token = NULL 
+            WHERE form_token IS NOT NULL 
+            AND id NOT IN (
+                SELECT id FROM rooms 
+                WHERE tenant_name IS NULL 
+                AND form_token IS NOT NULL
+            )
+        """)
+        
+        # Also clear tokens from beds that now have tenants
+        cur.execute("""
+            UPDATE rooms 
+            SET form_token = NULL 
+            WHERE tenant_name IS NOT NULL 
+            AND form_token IS NOT NULL
+        """)
+        
+        conn.commit()
+        logger.info("Form token cleanup completed")
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"cleanup_expired_tokens error: {e}")
+    finally:
+        cur.close()
+        release(conn)
+
+def get_token_stats():
+    """Get statistics about form tokens"""
+    conn = connect()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_tokens,
+                COUNT(CASE WHEN tenant_name IS NULL THEN 1 END) as active_tokens,
+                COUNT(CASE WHEN tenant_name IS NOT NULL THEN 1 END) as occupied_tokens
+            FROM rooms 
+            WHERE form_token IS NOT NULL
+        """)
+        
+        stats = cur.fetchone()
+        return {
+            'total_tokens': stats[0],
+            'active_tokens': stats[1], 
+            'occupied_tokens': stats[2]
+        }
+        
+    except Exception as e:
+        logger.error(f"get_token_stats error: {e}")
+        return None
+    finally:
         cur.close()
         release(conn)
